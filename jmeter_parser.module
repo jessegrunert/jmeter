@@ -1,0 +1,516 @@
+<?php
+/**
+ * Defines
+ */
+define('TELUS_SERVICES_CACHE_ID', 'telus_services');
+define('TELUS_SERVICES_PRELOAD_QUEUED', 0);
+define('TELUS_SERVICES_PRELOAD_RUNNING', 1);
+define('TELUS_SERVICES_PRELOAD_COMPLETE', 2);
+define('TELUS_SERVICES_PRELOAD_ERROR', 3);
+define('TELUS_SERVICES_QUEUE_TABLE', 'telus_services_queue');
+define('TELUS_SERVICES_MAX_WAIT_TIME', 20);
+define('TELUS_SERVICES_AUTH_OAUTH', 0);
+define('TELUS_SERVICES_AUTH_NONE', 1);
+
+ctools_include('object-cache');
+
+// @TODO: See if telus_services_cron() overlaps with telus_services_cronapi()
+
+/**
+ * Implements hook_cron().
+ *
+ * Every 30 check for stale records
+ *
+ */
+function telus_services_cron() {
+  if (variable_get('telus_services_cron', 0) < REQUEST_TIME - 1800) {
+
+    variable_set('telus_services_cron', REQUEST_TIME);
+
+    // Each service can have different cache expiry
+    $services = telus_service_get_info();
+    foreach ($services as $name => $service) {
+      $settings = variable_get('telus_services_' . $name, array());
+      $expiry = isset($settings['cache_expiry_time']) ? $settings['cache_expiry_time'] : 1800;
+
+      db_delete('ctools_object_cache')
+        ->condition('obj', TELUS_SERVICES_CACHE_ID)
+        ->condition('name', $service['cache name'] . "_%", "LIKE")
+        ->condition('updated', REQUEST_TIME - $expiry, '<')
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function telus_services_menu() {
+  $items = array();
+
+  $items ['admin/telus/services'] = array(
+    'title' => 'Services',
+    'page callback' => 'telus_services_landing_page',
+    'access arguments' => array('manage telus services'),
+    'file' => 'telus_services.admin.inc',
+    'weight' => 11
+  );
+  $items ['admin/telus/services/list'] = array(
+    'title' => 'List',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => - 10,
+    'access callback' => true,
+  );
+  $items ['admin/telus/services/settings'] = array(
+    'title' => 'Settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('telus_services_settings_page_form'),
+    'file' => 'telus_services.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'access arguments' => array('manage telus services'),
+  );
+
+  $items['admin/telus/services/clear_all_caches'] = array(
+    'title' => 'Clear All Cache',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('telus_service_clear_cache_form'),
+    'access callback' => 'telus_services_access_callback',
+    'access arguments' => array('clear'),
+    'file' => 'telus_services.admin.inc',
+  );
+
+  // call every defined service's hook_menu() function, so they can define their own menu items.
+  foreach(telus_service_get_ui_controller() as $controller) {
+    $items += $controller->hook_menu();
+  }
+
+  return $items;
+}
+
+/**
+ * Implements hook_forms().
+ */
+function telus_services_forms($form_id, $args) {
+  // this function will only be called if the service type form is not found. In that case
+  // this function will be called and the form will be routed to the controller
+  if (isset($args [0]) && is_string($args [0]) && telus_service_get_info($args [0])) {
+    $type = $args [0];
+  }
+
+  if (isset($type) && $controller = telus_service_get_ui_controller($type)) {
+    return $controller->hook_forms();
+  }
+}
+
+/**
+ * telus_services_form_submit().
+ * @description
+ *  an intermediary function to allow a form
+ *  submit override in a child class. the
+ *  controller class must have a static function
+ *  defined as service_form_submit, with
+ *  form and form_state parameters. The form
+ *  overridden in the controller class must have
+ *  a #submit form attribute using this function
+ *  as a callback.
+ */
+function telus_services_form_submit($form, &$form_state) {
+  // Get the service name from the form, pass the form and the form_state
+  // back off to the controller class. Nicer way to do this?
+  foreach ($form as $key=>$val) {
+    if(strpos($key, 'telus_services_') !== FALSE) {
+      $type = str_replace('telus_services_','', $key);
+      $controller = telus_service_get_ui_controller($type);
+      if ($controller && method_exists($controller, 'service_form_submit')) {
+        $controller::service_form_submit($form, $form_state);
+      }
+      break;
+    }
+  }
+}
+
+/**
+ * Implements hook_permission()
+ */
+function telus_services_permission() {
+  $permissions = array();
+
+  $permissions ['manage telus services'] = array(
+    'title' => t('Manage Telus services'),
+    'description' => t('Can manage settings for defined Telus services.'),
+    'restrict access' => TRUE
+  );
+
+  $permissions ['manage telus services performance'] = array(
+    'title' => t('Manage Telus service performance settings'),
+    'restrict access' => TRUE
+  );
+
+  $permissions ['manage telus services development'] = array(
+    'title' => t('Manage Telus service development settings'),
+    'restrict access' => TRUE
+  );
+
+  // service specific permissions
+  foreach(telus_service_get_info() as $name => $info) {
+    $permissions ['manage telus service ' . $name] = array(
+      'title' => t('Change !name settings', array(
+        '!name' => $info ['admin ui'] ['pretty name']
+      )),
+      'restrict access' => TRUE
+    );
+    $permissions ['clear telus service ' . $name . ' cache'] = array(
+      'title' => t('Clear !name cache', array(
+        '!name' => $info ['admin ui'] ['pretty name']
+      )),
+      'restrict access' => TRUE
+    );
+  }
+
+  return $permissions;
+}
+
+/**
+ * Get the info array for defined service(s)
+ *
+ * @param $service_name The name of the service for which the info shall be returned, or NULL.
+ * @return The info for the specified service, or info for all defined services if NULL is passed in.
+ */
+function telus_service_get_info($service_name = NULL) {
+  // Use the advanced drupal_static() pattern, since this is called very often.
+  static $drupal_static_fast;
+  if (! isset($drupal_static_fast)) {
+    $drupal_static_fast ['telus_service_info'] = &drupal_static(__FUNCTION__);
+  }
+  $service_info = &$drupal_static_fast ['telus_service_info'];
+
+  if (empty($service_info)) {
+    $service_info = module_invoke_all('telus_service_info');
+    // Merge in default values.
+    foreach($service_info as $name => $data) {
+      $service_info [$name] += array(
+        'controller class' => 'TelusDefaultService',
+        'admin ui' => array(),
+        'service path' => NULL,
+        'parameters' => array(),
+        'method' => 'POST',
+        'mime_type' => 'application/json',
+        'cache name' => 'telus_default_service',
+        'auth type' => TELUS_SERVICES_AUTH_OAUTH,
+      );
+
+      // Change default controller based on auth
+      if ($service_info[$name]['auth type'] == TELUS_SERVICES_AUTH_NONE) {
+        $service_info[$name]['controller class'] = 'TelusUnauthenticatedService';
+      }
+    }
+
+    // Let other modules alter the service info.
+    drupal_alter('telus_service_info', $service_info);
+  }
+
+  if (empty($service_name)) {
+    return $service_info;
+  }
+  elseif (isset($service_info [$service_name])) {
+    return $service_info [$service_name];
+  }
+}
+
+/**
+ * Get the info array for defined service server(s).
+ *
+ * @param null $server_name
+ *   The name of the service server for which the info shall be returned.
+ * @return array
+ *   The info for the specified service server, or info for all defined servers if NULL is passed in.
+ */
+function telus_service_server_get_info($server_name = NULL) {
+  // User the advanced drupal_static() pattern, since this is called very often.
+  static $drupal_static_fast;
+  if (! isset($drupal_static_fast)) {
+    $drupal_static_fast['telus_service_server_info'] = &drupal_static(__FUNCTION__);
+  }
+  $server_info = &$drupal_static_fast['telus_service_server_info'];
+
+  if (empty($server_info)) {
+    $server_info = module_invoke_all('telus_service_server_info');
+    // Merge in default values.
+    foreach($server_info as $name => $data) {
+      $server_info [$name] += array(
+        'server url' => NULL,
+        'default' => FALSE,
+        'active' => FALSE,
+        'pretty name' => ucwords(str_replace('_', ' ', $name)),
+      );
+    }
+
+    $selected = variable_get('telus_services_server', FALSE);
+
+    if ($selected) {
+      $server_info[$selected]['active'] = TRUE;
+    }
+
+    // Let other modules alter the service info.
+    drupal_alter('telus_service_server_info', $server_info);
+  }
+
+  if (empty($server_name)) {
+    return $server_info;
+  }
+  elseif (isset($server_info [$server_name])) {
+    return $server_info [$server_name];
+  }
+}
+
+/**
+ * Returns a loaded Telus service as requested by name.
+ *
+ * @param string $service_name
+ *          The service name as defined in hook_telus_service_info().
+ * @return TelusDefaultService
+ */
+function telus_service_load($service_name, $data = NULL) {
+  if(TelusOauth::get_state() === TRUE) {
+    return telus_service_get_controller($service_name, $data);
+  }
+}
+
+function telus_services_concurrent_curl_callback($output, $info, $request) {
+  $service = telus_service_get_controller($request->service_data['service_name'], $request->service_data['data']);
+  $service->log_service(json_decode($output));
+  $service->analyze_response(array('response' => json_decode($output), 'info' => $info));
+}
+
+/**
+ * Gets the service controller for a Telus service.
+ *
+ * @param string $service_name
+ *          The service name as defined in hook_telus_service_info().
+ * @return TelusDefaultService The service controller object for the specified service name.
+ */
+function telus_service_get_controller($service_name, $data) {
+  $static = &drupal_static(__FUNCTION__);
+
+  $service_info = telus_service_get_info($service_name);
+
+  $cache_name = telus_service_get_cache_name($service_info['cache name'], $data);
+
+  if (!isset($static [$cache_name])) {
+    $class = $service_info['controller class'];
+
+    $servers = telus_service_server_get_info();
+
+    $server_url = '';
+
+    foreach ($servers as $name => $server) {
+      if ($server['active']) {
+        $server_url = $server['server url'];
+        break;
+      }
+      elseif ($server['default']) {
+        $server_url = $server['server url'];
+      }
+    }
+
+    if ($server_url == '') {
+      watchdog('telus_service', "There ins't an active or default service server set.");
+    }
+
+    $parameters = array();
+    $parameters += $service_info['parameters'];
+    $parameters['service_url'] = $server_url . $service_info['service path'];
+    $parameters['cache_name'] = $service_info['cache name'];
+    $parameters['method'] = $service_info['method'];
+    $parameters['mime_type'] = $service_info['mime_type'];
+    $parameters['name'] = $service_name;
+    $parameters['auth_type'] = $service_info ['auth type'];
+
+    $static[$cache_name] = new $class($parameters, $data);
+  }
+
+  return $static [$cache_name];
+}
+
+/**
+ * This is a utility function which generates a unique name for a service call based off
+ * the data that is passed in.
+ * @param string $cache_name
+ * @param array $data
+ * @return string
+ */
+function telus_service_get_cache_name($cache_name, $data = NULL, $recursion = FALSE) {
+  global $language;
+
+  $ignore_keys = array(
+    'price',
+    'displayPrice',
+    'credit_class',
+    'account_type',
+    'plan',
+    'start_date',
+    'end_date',
+    'term_length',
+    'device_balance',
+  );
+
+  if(empty($data)) {
+    return $cache_name . '_' . $language->language . '_cache';
+  }
+
+  $pieces = array();
+  foreach($data as $key => $item) {
+
+    if (is_array($item)) {
+      $pieces[] = telus_service_get_cache_name($cache_name, $item, TRUE);
+    } else {
+      if(!in_array($key, $ignore_keys)) {
+        $pieces[] = $item;
+      }
+    }
+  }
+
+  if($recursion) {
+    return implode('_', $pieces);
+  }
+  else {
+    return $cache_name . '_' . implode('_', $pieces) . '_' . $language->language . '_cache';
+  }
+}
+
+
+/**
+ * Gets the UI controller for a Telus service.
+ *
+ * @param string $service_name
+ *          The service name as defined in hook_telus_service_info().
+ * @return TelusDefaultServiceUIController If a name is given, the controller for the given service name. Else an array
+ *         of all enabled UI controllers keyed by service name.
+ */
+function telus_service_get_ui_controller($service_name = NULL) {
+  $static = &drupal_static(__FUNCTION__);
+
+  if (! isset($service_name)) {
+    // Invoke the function for each type to ensure we have fully populated the
+    // static variable.
+    foreach(telus_service_get_info() as $service_name => $info) {
+      telus_service_get_ui_controller($service_name);
+    }
+    return array_filter($static);
+  }
+
+  if (! isset($static [$service_name])) {
+    $info = telus_service_get_info($service_name);
+    $class = isset($info ['admin ui'] ['controller class']) ? $info ['admin ui'] ['controller class'] : 'TelusDefaultServiceUIController';
+    $static [$service_name] = (isset($info ['admin ui'] ['path']) && $class) ? new $class($service_name, $info) : FALSE;
+  }
+
+  return $static [$service_name];
+}
+
+/**
+ *
+ * @param string $operation
+ *          The operation being checked, either 'manage' or 'clear'
+ * @param string $name
+ *          The service name as defined in hook_telus_service_info().
+ * @return boolean TRUE if access is allowed, FALSE otherwise.
+ */
+function telus_services_access_callback($operation, $name) {
+  if ($operation == 'manage') {
+    return user_access('manage telus services') && user_access('manage telus service ' . $name);
+  }
+  elseif ($operation == 'clear') {
+    return user_access('manage telus services') && user_access('clear telus service ' . $name . ' cache');
+  }
+  return FALSE;
+}
+
+function telus_service_process_queue() {
+  // some sanity checks, see how many services are queued, make sure there's at least one.
+  $count = db_query("SELECT count(*) as count FROM {" . TELUS_SERVICES_QUEUE_TABLE . "} WHERE session_id = :session_id AND status = :status", array(':session_id' => session_id(), 'status' => TELUS_SERVICES_PRELOAD_QUEUED))->fetch()->count;
+  if($count > 0) {
+    _telus_services_spawn_worker();
+  }
+}
+
+/**
+ * Utility function that spawns a new worker thread.
+ */
+function _telus_services_spawn_worker() {
+
+  # This function depends on worker.php being there.
+  if (!defined('TELUS_SERVICES_WORKER_PATH')) {
+    watchdog('telus_services', 'Aborting at line ' . __LINE__ . ',' . __FUNCTION__ . ': TELUS_SERVICES_WORKER_PATH was not defined in settings.php.', array(), WATCHDOG_ERROR);
+    return;
+  }
+  if (!file_exists(TELUS_SERVICES_WORKER_PATH)) {
+    watchdog('telus_services', 'Aborting at line ' . __LINE__ . ',' . __FUNCTION__ . ': TELUS_SERVICES_WORKER_PATH was defined, but does not exist: !TSWP', array('!TSWP' => TELUS_SERVICES_WORKER_PATH), WATCHDOG_ERROR);
+    return;
+  }
+
+  # It's extremely important to have a location to write to (even if it's /dev/null) otherwise the nohup fails, and causes big problems
+  if (!defined('COMMERCE_INSTALL_PATH')) {
+    watchdog('telus_services', 'Output from worker.php is being discarded. COMMERCE_INSTALL_PATH was not defined in settings.php.', array(), WATCHDOG_ERROR);
+    $logfile = "/dev/null";
+  }
+  elseif (!file_exists(COMMERCE_INSTALL_PATH)) {
+    watchdog('telus_services', 'Output from worker.php is being discarded. COMMERCE_INSTALL_PATH is defined, but the path doese not exist: !CIP ', array('!CIP' => COMMERCE_INSTALL_PATH), WATCHDOG_ERROR);
+    $logfile = "/dev/null";
+  }
+  else {
+    $logfile = COMMERCE_INSTALL_PATH . '/logs/worker.log';
+    if (!file_exists($logfile)) {
+      if (!touch($logfile)) {
+        watchdog('telus_services', 'Output from worker.php is being discarded. Could not write to logfile: !LOGFILE', array('!LOGFILE' => $logfile), WATCHDOG_ERROR);
+        $logfile = "/dev/null";
+      }
+    }
+    if (!is_writable($logfile)) {
+      watchdog('telus_services', 'Output from worker.php is being discarded. Could not write to logfile: !LOGFILE', array('!LOGFILE' => $logfile), WATCHDOG_ERROR);
+      $logfile = "/dev/null";
+    }
+  }
+
+  $command = 'nohup php ' . TELUS_SERVICES_WORKER_PATH . ' ' . session_name() . ' ' . session_id() . ' >> ' . $logfile . ' 2>&1 & echo $!';
+  exec($command ,$op);
+  $pid = (int)$op[0];
+
+  if(!($pid > 0)) {
+    watchdog('telus_services', 'Failed to spawn worker process', array(), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Removes old service queue entries which are no longer needed.
+ */
+function telus_services_clear_old_queue_entries() {
+  $num_deleted = db_delete('telus_services_queue')
+    ->condition('timestamp', strtotime('-5 minutes'), '<')
+    ->condition('status', array(TELUS_SERVICES_PRELOAD_COMPLETE,TELUS_SERVICES_PRELOAD_ERROR), 'IN')
+    ->execute();
+
+    watchdog('Telus Services Clear Queue', 'Telus Services Cleared ' . $num_deleted . ' rows from the telus_services_queue table');
+}
+
+/**
+ * Implements hook_cronapi
+ * @return array
+ */
+function telus_services_cronapi() {
+  return array(
+    'telus_services_clear_old_queue_entries' => array(
+      'title' => 'Clear old Telus Service queue entries',
+      'scheduler' => array(
+        'name' => 'crontab',
+        'crontab' => array(
+          'rules' => array(
+            '*/5 * * * *',
+          )
+        ),
+      ),
+      'callback' => 'telus_services_clear_old_queue_entries',
+      'callback arguments' => FALSE,
+    ),
+  );
+}

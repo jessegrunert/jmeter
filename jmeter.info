@@ -1,0 +1,5 @@
+name = Jmeter
+description = Run Jmeter scripts and parse the result in Drupal
+package = Jmeter
+core = 7.x
+files[] = jmeter.admin.inc

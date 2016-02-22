@@ -1,0 +1,29 @@
+<?php
+
+
+
+function jmeter_schema() {
+  $schema = array();
+
+  //the new preload schema - should match the table in hook_schema
+  $schema['jmeter_jobs'] = array(
+    'description' => 'A table to store jmeter jobs',
+    'fields' => array(
+      'id' => array(
+        'description' => 'Primary key',
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE
+      ),
+      'job_description' => array(
+        'description' => 'The description of the jmeter job.',
+        'type' => 'varchar',
+        'length' => '255',
+        'not null' => TRUE
+      ),
+    ),
+    'primary key' => array('id'),
+  );
+
+  return $schema;
+}
