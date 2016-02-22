@@ -1,1 +1,41 @@
 <?php
+
+/**
+ * Implements hook_menu().
+ */
+function jmeter_menu() {
+  $items = array();
+
+  $items ['admin/config/development/jmeter'] = array(
+    'title' => 'Jmeter',
+    'page callback' => 'jmeter_landing_page',
+    'access arguments' => array('administer site configuration'),
+    'file' => 'jmeter.admin.inc',
+  );
+  $items ['admin/config/development/jmeter/jobs'] = array(
+    'title' => 'Jobs',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => 1,
+    'access arguments' => array('administer site configuration'),
+  );
+  $items ['admin/config/development/jmeter/add'] = array(
+    'title' => 'Add',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('jmeter_add_job_form'),
+    'file' => 'jmeter.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 2,
+    'access arguments' => array('administer site configuration'),
+  );
+  $items ['admin/config/development/jmeter/settings'] = array(
+    'title' => 'Settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('jmeter_settings_page_form'),
+    'file' => 'jmeter.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 99,
+    'access arguments' => array('administer site configuration'),
+  );
+
+  return $items;
+}
